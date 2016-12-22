@@ -1,11 +1,12 @@
 {application, stream,
- [{description, "An OTP application"},
-  {vsn, "0.1.0"},
-  {registered, []},
-  {mod, { stream_app, []}},
+ [{description, "stream of thought routed by erlang actors and messages"},
+  {vsn, git},
+  {registered, [stream_sup]},
+  {mod, {stream_app, []}},
   {applications,
-   [kernel,
-    stdlib
+   [kernel
+    , stdlib
+    , cowboy
    ]},
   {env,[]},
   {modules, []},
