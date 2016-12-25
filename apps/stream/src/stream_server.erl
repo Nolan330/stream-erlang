@@ -3,39 +3,75 @@
 -export([init/0, init/2, think/1, remember/1, membe/1]).
 -export([generate_thoughts/1, generate_thought/1]).
 
--include("stream_mnesia.hrl").
+-include("./stream_mnesia.hrl").
 -include_lib("stdlib/include/qlc.hrl").
 
 init(Req, Opts) ->
-    {ok, StreamBody, _} = cowboy_req:body(Req),
-    Twilio = parse_body(binary_to_list(StreamBody)),
-    %%{_, Thought} = proplists:lookup("Body", Twilio),
-    %%{_, FromNumber} = proplists:lookup("From", Twilio),
-    io:fwrite("Thought-----\n\t~p\n-----Thought\n", [Twilio]),
+    {ok, HttpBody, _} = cowboy_req:body_qs(Req),
+    io:fwrite("\nData---\n~p\n---Data\n", [HttpBody]),
+
+    {_, SmsBody} = proplists:lookup(<<"Body">>, HttpBody),
+    io:fwrite("\nData---\n~s\n---Data\n", [SmsBody]),
+
+    ThoughtData = parse_to_proplist(binary_to_list(SmsBody), ";", ":"),
+    io:fwrite("\nData---\n~p\n---Data\n", [ThoughtData]),
+
+    %%Thought = proplist_to_thought(ThoughtData),
+    %% Thought = parse_thought(SmsBody)
+    %% Think(Thought)
+
+    %% handle(Body)
+    %% can never explicitly define time, source, (vsn?)
+    %%
+    %% minimum case: send only thought body.
+    %%  text: body
+    %%  time: ingesttime
+    %%  geo: {latlong, {Lat, Long}} | {zip, Zip} | {city, City} | {state, State} | {geo, Geo}
+    %%  insp: []
+    %%  tags: []
+    %%  source: twilio -- need to determine type (raw erlang vs. web vs. twilio vs. ...?)
+    %%  vsn: ??
+    %%
+    %% dialog:
+    %%  want to add tags? <show relevant existing tags> -> no | tags (list of atoms)
+    %%  using <geo> as geo, wanna change that? -> timeout | no | geo
+    %%  what inspired you?
+    %%
+    %% maximum case: send delimited
+    %%  text: ...&
+    %%  geo: type, Value&
+    %%  insp: ...&
+    %%  tags: ...&
+    %%  vsn: ??
+
     StreamReq = cowboy_req:reply(200,
                                  [{<<"content-type">>, <<"text/plain">>}],
-                                 io_lib:format("~p",[Twilio]),
+                                 "K I shat {" ++ io_lib:format("~p", [ThoughtData]) ++ "} into your database.",
                                  Req),
     {ok, StreamReq, Opts}.
 
-parse_body(Body) ->
-    lists:filtermap(
-        fun (Prop) -> parse_prop(Prop) end,
-        string:tokens(Body, "&")).
 
-parse_prop(Prop) ->
-    case string:tokens(Prop, "=") of
-        [Name, Value] -> {true, {erlang:list_to_atom(Name), Value}};
-        _ -> false
-    end.
+%% generic function to handle tokenizing/processing nested delimited strings
+parse_to_proplist(Body, OuterToken, InnerToken) ->
+    lists:filtermap(
+        fun (KV) ->
+            case string:tokens(KV, InnerToken) of
+                [Key, Value] -> {true, {erlang:list_to_atom(string:strip(Key)), string:strip(Value)}};
+                _ -> false
+            end
+        end,
+        string:tokens(Body, OuterToken)).
+
 
 %% initializes a new node
 init() ->
+    mnesia:create_schema([node()]),
+    mnesia:start(),
     mnesia:create_table(thought,
                         [{disc_copies, [node()]},
-                         {attributes, record_info(fields, thought)}]),
-    mnesia:wait_for_tables([thought], 5000).
+                         {attributes, record_info(fields, thought)}]).
 
+%% debug functions - tmp
 generate_thoughts(N) ->
     [generate_thought(Nt) || Nt <- lists:seq(1, N)].
 
@@ -48,8 +84,7 @@ generate_thought(N) ->
 			  vsn = 1}.
 
 %% TODO:
-%% web server + sms
-%% password/auth
+%% password/auth? check FromNumber?
 %% blob storage
 %% better integrated/orthogonal filtering
 %% general orthogonality of operations

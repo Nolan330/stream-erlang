@@ -1,15 +1,19 @@
--record(uthought, {text,
-		   time,
-		   geo,
-		   insp,
-		   tags,
-		   vsn}).
+-record(uthought,
+        {text,
+         time,
+         geo,
+         insp,
+         tags,
+         source,
+         vsn}).
 
--record(thought, {text,
-		  time,
-		  geo,
-		  insp,
-		  tags,
-		  vsn,
-		  sig,
-		  score}).
+-record(thought,
+        {text,
+         time,
+         geo,
+         insp,
+         tags,
+         source,
+         vsn,
+         sig,
+         score}).
