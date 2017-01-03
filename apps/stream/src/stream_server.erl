@@ -1,72 +1,121 @@
 -module(stream_server).
 
--export([init/0, init/2, think/1, remember/1, membe/1]).
+-export([start/0]). %% stream
+-export([init/2]).  %% cowboy
+-export([create_schema/0, create_table/0]). %% mnesia
+-export([think/1, remember/1, membe/1]).
 -export([generate_thoughts/1, generate_thought/1]).
 
 -include("./stream_mnesia.hrl").
 -include_lib("stdlib/include/qlc.hrl").
 
+%% cowboy request handler
 init(Req, Opts) ->
-    {ok, HttpBody, _} = cowboy_req:body_qs(Req),
-    io:fwrite("\nData---\n~p\n---Data\n", [HttpBody]),
+    Thought = req_to_thought(Req), io:fwrite("\n~p\n", [Thought]),
+    think(Thought),
 
-    {_, SmsBody} = proplists:lookup(<<"Body">>, HttpBody),
-    io:fwrite("\nData---\n~s\n---Data\n", [SmsBody]),
-
-    ThoughtData = parse_to_proplist(binary_to_list(SmsBody), ";", ":"),
-    io:fwrite("\nData---\n~p\n---Data\n", [ThoughtData]),
-
-    %%Thought = proplist_to_thought(ThoughtData),
-    %% Thought = parse_thought(SmsBody)
-    %% Think(Thought)
-
-    %% handle(Body)
-    %% can never explicitly define time, source, (vsn?)
-    %%
-    %% minimum case: send only thought body.
-    %%  text: body
-    %%  time: ingesttime
-    %%  geo: {latlong, {Lat, Long}} | {zip, Zip} | {city, City} | {state, State} | {geo, Geo}
-    %%  insp: []
-    %%  tags: []
-    %%  source: twilio -- need to determine type (raw erlang vs. web vs. twilio vs. ...?)
-    %%  vsn: ??
-    %%
     %% dialog:
-    %%  want to add tags? <show relevant existing tags> -> no | tags (list of atoms)
-    %%  using <geo> as geo, wanna change that? -> timeout | no | geo
-    %%  what inspired you?
-    %%
-    %% maximum case: send delimited
-    %%  text: ...&
-    %%  geo: type, Value&
-    %%  insp: ...&
-    %%  tags: ...&
-    %%  vsn: ??
+    %%  want to add tags? these look eh: <show relevant existing tags> -> no | tags (list of atoms)
+    %%  tags can be added using a tagging process
+    %%  tagging process would be responsible for processing previous thoughts:
+    %%  1. apply tfidf on all thoughts
+    %%  2. select top n thoughts.tags above threshhold
+    %%  3. list tags in a response text
+    %%  4. allow an symmetrically delimited sms indicating yes or no for each
+    %%      a. <tag1>, <tag2>, ..., <tagn>
+    %%      b. yes, no, yes, ..., yes
+    %%      c. 1,0,1,0,1,0,1, ....,0
+    %%      d. 10110101101.......10
 
     StreamReq = cowboy_req:reply(200,
                                  [{<<"content-type">>, <<"text/plain">>}],
-                                 "K I shat {" ++ io_lib:format("~p", [ThoughtData]) ++ "} into your database.",
+                                 "K I shat your thought into your database.",
                                  Req),
     {ok, StreamReq, Opts}.
 
 
-%% generic function to handle tokenizing/processing nested delimited strings
-parse_to_proplist(Body, OuterToken, InnerToken) ->
+%% remember dialog ?
+
+%% parse a Twilio SMS request to a thought
+req_to_thought(Req) ->
+    {ok, ReqBody, _}    = cowboy_req:body_qs(Req),
+    ReqHeaders          = cowboy_req:headers(Req),
+    SmsBody             = string:to_lower(binary_to_list(proplists:get_value(<<"Body">>, ReqBody))),
+    SmsProps            = sms_to_props(SmsBody),
+    #uthought{
+        text    = proplists:get_value(thought, SmsProps),
+        time    = calendar:now_to_universal_time(erlang:timestamp()),
+        geo     = smsprops_to_geo(SmsProps),
+        insp    = proplists:get_value(insp, SmsProps),
+        tags    = smsprops_to_tags(SmsProps),
+        source  = req_to_source(ReqHeaders, ReqBody),
+        vsn     = 1}.
+
+sms_to_props(SmsBody) ->
+    OuterDelim = ".",
+    InnerDelim = ":",
+    case string:str(SmsBody, OuterDelim) of
+        0 -> [{thought, SmsBody}];
+        _ -> [{thought, string:substr(SmsBody, 1, string:cspan(SmsBody, OuterDelim))}] ++
+             parse_to_proplist(SmsBody, OuterDelim, InnerDelim)
+    end.
+
+%% generic function to handle processing nested delimited strings
+parse_to_proplist(Text, OuterDelim, InnerDelim) ->
     lists:filtermap(
-        fun (KV) ->
-            case string:tokens(KV, InnerToken) of
+        fun (KVText) ->
+            case string:tokens(KVText, InnerDelim) of
                 [Key, Value] -> {true, {erlang:list_to_atom(string:strip(Key)), string:strip(Value)}};
-                _ -> false
+                _            -> false
             end
         end,
-        string:tokens(Body, OuterToken)).
+        string:tokens(Text, OuterDelim)).
+
+%% clean up latlong format copied from iPhone compass app
+smsprops_to_geo(SmsProps) ->
+    case proplists:is_defined(geo, SmsProps) andalso
+         string:str(proplists:get_value(geo, SmsProps), "°") > 0 of
+        true    -> geoprop_to_term(proplists:get_value(geo, SmsProps));
+        false   -> undefined
+    end.
+
+geoprop_to_term(GeoProp) ->
+    Geo = re:replace(GeoProp, "[^A-Za-z0-9]+", ",", [global, {return, list}]),
+    case [string:strip(X) || X <- string:tokens(Geo, ",")] of
+        [D1,M1,S1,Dir1,D2,M2,S2,Dir2] -> {latlong, {{D1,M1,S1,Dir1},{D2,M2,S2,Dir2}}}
+    end.
+
+%% parse a comma separated list of tags
+smsprops_to_tags(SmsProps) ->
+    case proplists:is_defined(tags, SmsProps) of
+        true    -> [string:strip(Tag) || Tag <- string:tokens(proplists:get_value(tags, SmsProps), ",")];
+        false   -> undefined
+    end.
+
+%% extract the source from the req
+req_to_source(ReqHeaders, ReqBody) ->
+    UserAgent = erlang:list_to_atom(string:to_lower(binary_to_list(proplists:get_value(<<"user-agent">>, ReqHeaders)))),
+    case UserAgent of
+        'twilioproxy/1.1'   -> {twilio, [{binary_to_list(A), binary_to_list(B)} || {A, B} <-
+                                    [proplists:lookup(<<"From">>, ReqBody),
+                                     proplists:lookup(<<"MessageSid">>, ReqBody),
+                                     proplists:lookup(<<"AccountSid">>, ReqBody)]]};
+        _                   -> {http}
+    end.
 
 
 %% initializes a new node
-init() ->
-    mnesia:create_schema([node()]),
-    mnesia:start(),
+start() ->
+    mnesia:stop(),
+    application:set_env(mnesia, dir, "/Users/Nolan/mnesia/stream/"),
+    mnesia:start().
+
+%% common creates for when needed
+%% unneeded for boot sequence
+create_schema() ->
+    mnesia:create_schema([node()]).
+
+create_table() ->
     mnesia:create_table(thought,
                         [{disc_copies, [node()]},
                          {attributes, record_info(fields, thought)}]).
@@ -81,6 +130,7 @@ generate_thought(N) ->
 			  geo = "The Dungeon",
 			  insp = "a rather uninspiring thought",
 			  tags = ["erlang", "stream"],
+              source = {http},
 			  vsn = 1}.
 
 %% TODO:
@@ -90,6 +140,7 @@ generate_thought(N) ->
 %% general orthogonality of operations
 %% remember({related, ...}).
 %% analytics
+
 
 %% think
 %%
@@ -146,14 +197,15 @@ finalize(F) ->
 	Val.
 
 %% returns a signature for the input thought.
-sign_thought({uthought, Text, Time, Geo, Insp, Tags, 1}) ->
+sign_thought({uthought, Text, Time, Geo, Insp, Tags, Source, 1}) ->
     #thought{text = Text,
              time = Time,
              geo = Geo,
              insp = Insp,
              tags = Tags,
+             source = Source,
              vsn = 1,
-             sig = crypto:hash(sha256, term_to_binary({Text, Time, Geo, Insp, Tags, 1})),
+             sig = crypto:hash(sha256, term_to_binary({Text, Time, Geo, Insp, Tags, Source, 1})),
              score = 1}.
 
 %% increases the score of each Thought and returns all incremented Thoughts
