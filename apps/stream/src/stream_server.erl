@@ -1,38 +1,50 @@
 -module(stream_server).
 
--export([start/0]). %% stream
--export([init/2]).  %% cowboy
--export([create_schema/0, create_table/0]). %% mnesia
--export([think/1, remember/1, membe/1]).
--export([generate_thoughts/1, generate_thought/1]).
+-export([think/1,		    %% stream
+         remember/1,
+         membe/1]).
+-export([init/2]).		    %% cowboy
+-export([reinitialize/0,    %% mnesia
+         start/0,
+         create_table/0]).
+
+-export([generate_thoughts/1,	%% debug
+         generate_thought/1]).
 
 -include("./stream_mnesia.hrl").
 -include_lib("stdlib/include/qlc.hrl").
 
-%% cowboy request handler
+%% dialog:
+%%  want to add tags? these look avg:
+%%      <show relevant existing tags> -> no | tags (list of atoms)
+%%  tags can be added using a tagging process
+%%  tagging process would be responsible for processing previous thoughts:
+%%  1. apply tfidf on all thoughts
+%%  2. select top n thoughts.tags above threshhold
+%%  3. list tags in a response text
+%%  4. allow an symmetrically delimited sms indicating yes or no for each
+%%      a. <tag1>, <tag2>, ..., <tagn>
+%%      b. yes, no, yes, ..., yes
+%%      c. 1,0,1,0,1,0,1, ....,0
+%%      d. 10110101101.......10
+
+%% stream request handler
 init(Req, Opts) ->
-    Thought = req_to_thought(Req), io:fwrite("\n~p\n", [Thought]),
-    think(Thought),
-
-    %% dialog:
-    %%  want to add tags? these look eh: <show relevant existing tags> -> no | tags (list of atoms)
-    %%  tags can be added using a tagging process
-    %%  tagging process would be responsible for processing previous thoughts:
-    %%  1. apply tfidf on all thoughts
-    %%  2. select top n thoughts.tags above threshhold
-    %%  3. list tags in a response text
-    %%  4. allow an symmetrically delimited sms indicating yes or no for each
-    %%      a. <tag1>, <tag2>, ..., <tagn>
-    %%      b. yes, no, yes, ..., yes
-    %%      c. 1,0,1,0,1,0,1, ....,0
-    %%      d. 10110101101.......10
-
-    StreamReq = cowboy_req:reply(200,
-                                 [{<<"content-type">>, <<"text/plain">>}],
-                                 "K I shat your thought into your database.",
-                                 Req),
-    {ok, StreamReq, Opts}.
-
+    case is_twilio(Req) of
+        true ->
+            Thought = req_to_thought(Req),
+            think(Thought),
+            StreamReq = cowboy_req:reply(200,
+                                         [{<<"content-type">>, <<"text/plain">>}],
+                                         "k i shat your thought into your database.",
+                                         Req),
+            {ok, StreamReq, Opts};
+        false ->
+            StreamReq = cowboy_req:reply(200,
+                                         [{<<"content-type">>, <<"text/plain">>}],
+                                         "do not address me",
+                                         Req),
+            {ok, StreamReq, Opts}.
 
 %% remember dialog ?
 
@@ -47,9 +59,9 @@ req_to_thought(Req) ->
         time    = calendar:now_to_universal_time(erlang:timestamp()),
         geo     = smsprops_to_geo(SmsProps),
         insp    = proplists:get_value(insp, SmsProps),
-        tags    = smsprops_to_tags(SmsProps),
-        source  = req_to_source(ReqHeaders, ReqBody),
-        vsn     = 1}.
+        tags    = delimited_to_list(SmsProps, tags),
+        links   = delimited_to_list(SmsProps, links),
+        source  = req_to_source(ReqHeaders, ReqBody)}.
 
 sms_to_props(SmsBody) ->
     OuterDelim = ".",
@@ -58,6 +70,37 @@ sms_to_props(SmsBody) ->
         0 -> [{thought, SmsBody}];
         _ -> [{thought, string:substr(SmsBody, 1, string:cspan(SmsBody, OuterDelim))}] ++
              parse_to_proplist(SmsBody, OuterDelim, InnerDelim)
+    end.
+
+%% clean up latlong format copied from iPhone compass app
+smsprops_to_geo(SmsProps) ->
+    GeoProp = proplists:get_value(geo, SmsProps, []),
+    case string:str(GeoProp, "°") > 0 of
+        true    -> geoprop_to_term(GeoProp);
+        false   -> undefined
+    end.
+geoprop_to_term(GeoProp) ->
+    Geo = re:replace(GeoProp, "[^A-Za-z0-9]+", ",", [global, {return, list}]),
+    case [string:strip(X) || X <- string:tokens(Geo, ",")] of
+        [D1,M1,S1,Dir1,D2,M2,S2,Dir2] -> {latlong, {{D1,M1,S1,Dir1},{D2,M2,S2,Dir2}}}
+    end.
+
+%% parse a comma separated string prop value into an erlang list
+commaseparated_to_list(PropName, SmsProps) ->
+    case proplists:is_defined(PropName, SmsProps) of
+        true    -> [string:strip(Prop) || Prop <- string:tokens(proplists:get_value(PropName, SmsProps), ",")];
+        false   -> undefined
+    end.
+
+%% extract the thought source from the req
+req_to_source(ReqHeaders, ReqBody) ->
+    UserAgent = erlang:list_to_atom(string:to_lower(binary_to_list(proplists:get_value(<<"user-agent">>, ReqHeaders)))),
+    case UserAgent of
+        'twilioproxy/1.1'   -> {twilio, [{binary_to_list(A), binary_to_list(B)} || {A, B} <-
+                                    [proplists:lookup(<<"From">>, ReqBody),
+                                     proplists:lookup(<<"MessageSid">>, ReqBody),
+                                     proplists:lookup(<<"AccountSid">>, ReqBody)]]};
+        _                   -> {http}
     end.
 
 %% generic function to handle processing nested delimited strings
@@ -71,49 +114,12 @@ parse_to_proplist(Text, OuterDelim, InnerDelim) ->
         end,
         string:tokens(Text, OuterDelim)).
 
-%% clean up latlong format copied from iPhone compass app
-smsprops_to_geo(SmsProps) ->
-    case proplists:is_defined(geo, SmsProps) andalso
-         string:str(proplists:get_value(geo, SmsProps), "°") > 0 of
-        true    -> geoprop_to_term(proplists:get_value(geo, SmsProps));
-        false   -> undefined
-    end.
-
-geoprop_to_term(GeoProp) ->
-    Geo = re:replace(GeoProp, "[^A-Za-z0-9]+", ",", [global, {return, list}]),
-    case [string:strip(X) || X <- string:tokens(Geo, ",")] of
-        [D1,M1,S1,Dir1,D2,M2,S2,Dir2] -> {latlong, {{D1,M1,S1,Dir1},{D2,M2,S2,Dir2}}}
-    end.
-
-%% parse a comma separated list of tags
-smsprops_to_tags(SmsProps) ->
-    case proplists:is_defined(tags, SmsProps) of
-        true    -> [string:strip(Tag) || Tag <- string:tokens(proplists:get_value(tags, SmsProps), ",")];
-        false   -> undefined
-    end.
-
-%% extract the source from the req
-req_to_source(ReqHeaders, ReqBody) ->
-    UserAgent = erlang:list_to_atom(string:to_lower(binary_to_list(proplists:get_value(<<"user-agent">>, ReqHeaders)))),
-    case UserAgent of
-        'twilioproxy/1.1'   -> {twilio, [{binary_to_list(A), binary_to_list(B)} || {A, B} <-
-                                    [proplists:lookup(<<"From">>, ReqBody),
-                                     proplists:lookup(<<"MessageSid">>, ReqBody),
-                                     proplists:lookup(<<"AccountSid">>, ReqBody)]]};
-        _                   -> {http}
-    end.
-
-
-%% initializes a new node
-start() ->
+reinitialize() ->
     mnesia:stop(),
-    application:set_env(mnesia, dir, "/Users/Nolan/mnesia/stream/"),
-    mnesia:start().
+    application:set_env(mnesia, dir, node()).
 
-%% common creates for when needed
-%% unneeded for boot sequence
-create_schema() ->
-    mnesia:create_schema([node()]).
+start() ->
+    mnesia:start().
 
 create_table() ->
     mnesia:create_table(thought,
@@ -130,12 +136,10 @@ generate_thought(N) ->
 			  geo = "The Dungeon",
 			  insp = "a rather uninspiring thought",
 			  tags = ["erlang", "stream"],
-              source = {http},
-			  vsn = 1}.
+              source = {http}}.
 
 %% TODO:
-%% password/auth? check FromNumber?
-%% blob storage
+%% blob storage - pictures?
 %% better integrated/orthogonal filtering
 %% general orthogonality of operations
 %% remember({related, ...}).
@@ -157,16 +161,15 @@ think(Thought) ->
 remember(all) ->
 	do(qlc:q([Thought || Thought <- mnesia:table(thought)]));
 
-remember({textContains, T}) ->
+remember({text_contains, T}) ->
 	do_then(qlc:q([Thought || Thought <- mnesia:table(thought),
-				  string:str(Thought#thought.text, T) > 0]),
+				                         string:str(Thought#thought.text, T) > 0]),
 			fun(Ts) -> increment_score(Ts) end).
 
-%remember({timeRange, R}) -> ;
-%remember({geoRange, R}) -> ;
-%remember({inspContains, T}) -> ;
-%remember({tagsContains, T}) -> ;
-%remember({vsn, V}) -> ;
+%remember({time_range, R}) -> ;
+%remember({geo_range, R}) -> ;
+%remember({insp_contains, T}) -> ;
+%remember({tags_contains, T}) -> ;
 %remember({sig, Sig}) -> ;
 
 
@@ -178,9 +181,7 @@ membe(N) -> [N].
 
 %% performs a DB op defined by Q
 do(Q) ->
-	F = fun() ->
-			qlc:e(Q)
-		end,
+	F = fun() -> qlc:e(Q) end,
 	finalize(F).
 
 %% performs a DB op defined by Q, followed by a task Fun
@@ -197,15 +198,14 @@ finalize(F) ->
 	Val.
 
 %% returns a signature for the input thought.
-sign_thought({uthought, Text, Time, Geo, Insp, Tags, Source, 1}) ->
-    #thought{text = Text,
+sign_thought({uthought, Text, Time, Geo, Insp, Tags, Source}) ->
+    #thought{sig = crypto:hash(sha256, term_to_binary({Text, Time, Geo, Insp, Tags, Source})),
+             text = Text,
              time = Time,
              geo = Geo,
              insp = Insp,
              tags = Tags,
              source = Source,
-             vsn = 1,
-             sig = crypto:hash(sha256, term_to_binary({Text, Time, Geo, Insp, Tags, Source, 1})),
              score = 1}.
 
 %% increases the score of each Thought and returns all incremented Thoughts

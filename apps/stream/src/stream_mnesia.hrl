@@ -4,16 +4,16 @@
          geo,
          insp,
          tags,
-         source,
-         vsn}).
+         links,
+         source}).
 
 -record(thought,
-        {text,
+        {sig,
+         text,
          time,
          geo,
          insp,
          tags,
+         links,
          source,
-         vsn,
-         sig,
          score}).
