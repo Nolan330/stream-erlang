@@ -1,7 +1,7 @@
 stream
 =====
 
-An OTP application
+A silly experiment with Twilio and Erlang
 
 Build
 -----
